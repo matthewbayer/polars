@@ -1698,7 +1698,7 @@ def test_scan_from_object_nonzero_offset(
     format: str,
     use_bytesio: bool,
 ) -> None:
-    def read(source: Any) -> pl.DataFrame:
+    def read(source: Any) -> Any:
         return (
             getattr(pl, f"scan_{format}")(source).collect()
             if lazy
@@ -1716,15 +1716,15 @@ def test_scan_from_object_nonzero_offset(
     f_bytesio = io.BytesIO()
     padding = 100 * b"\xff"
 
-    with path.open("wb") as f_disk:
-        f = f_bytesio if use_bytesio else f_disk
+    with path.open("wb") as f_wb_disk:
+        f = f_bytesio if use_bytesio else f_wb_disk
         f.write(padding)
         write(pl.DataFrame({"x": 1}), f)
 
     f_bytesio.seek(0)
 
-    with path.open("rb") as f_disk:
-        f = f_bytesio if use_bytesio else f_disk
+    with path.open("rb") as f_rb_disk:
+        f = f_bytesio if use_bytesio else f_rb_disk
         assert f.read(100) == padding
 
         assert_frame_equal(read(f), pl.DataFrame({"x": 1}))
