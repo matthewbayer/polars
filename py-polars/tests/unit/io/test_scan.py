@@ -1717,14 +1717,14 @@ def test_scan_from_object_nonzero_offset(
     padding = 100 * b"\xff"
 
     with path.open("wb") as f_wb_disk:
-        f = f_bytesio if use_bytesio else f_wb_disk
-        f.write(padding)
-        write(pl.DataFrame({"x": 1}), f)
+        f_wb = f_bytesio if use_bytesio else f_wb_disk
+        f_wb.write(padding)
+        write(pl.DataFrame({"x": 1}), f_wb)
 
     f_bytesio.seek(0)
 
     with path.open("rb") as f_rb_disk:
-        f = f_bytesio if use_bytesio else f_rb_disk
-        assert f.read(100) == padding
+        f_rb = f_bytesio if use_bytesio else f_rb_disk
+        assert f_rb.read(100) == padding
 
-        assert_frame_equal(read(f), pl.DataFrame({"x": 1}))
+        assert_frame_equal(read(f_rb), pl.DataFrame({"x": 1}))
