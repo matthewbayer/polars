@@ -2288,12 +2288,16 @@ def test_write_csv_raise_on_non_utf8_17328(
             df_no_lists.write_csv((tmp_path / "dangling.csv").open("w", encoding="gbk"))
 
 
-def test_write_csv_appending_17543() -> None:
-    f = io.BytesIO()
+@pytest.mark.write_disk
+def test_write_csv_appending_17543(tmp_path: Path) -> None:
+    tmp_path.mkdir(exist_ok=True)
     df = pl.DataFrame({"col": ["value"]})
-    f.write(b"# test\n")
-    df.write_csv(f)
-    pl.read_csv(f, skip_lines=1).equals(df)
+    with (tmp_path / "append.csv").open("w") as f:
+        f.write("# test\n")
+        df.write_csv(f)
+    with (tmp_path / "append.csv").open("r") as f:
+        assert f.readline() == "# test\n"
+        assert pl.read_csv(f).equals(df)
 
 
 def test_write_csv_passing_params_18825(chunk_override: None) -> None:

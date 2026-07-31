@@ -1685,3 +1685,45 @@ def test_read_projection_and_row_index(format: str, use_pyarrow: bool) -> None:
             {"index": 0, "b": 2}, schema_overrides={"index": pl.get_index_type()}
         ),
     )
+
+
+@pytest.mark.parametrize("use_bytesio", [True, False])
+@pytest.mark.parametrize("lazy", [True, False])
+@pytest.mark.parametrize("format", ["parquet", "ipc", "csv", "ndjson"])
+@pytest.mark.write_disk
+def test_scan_from_object_nonzero_offset(
+    tmp_path: Path,
+    lazy: bool,
+    format: str,
+    use_bytesio: bool,
+) -> None:
+    def read(source: Any) -> pl.DataFrame:
+        return (
+            getattr(pl, f"scan_{format}")(source).collect()
+            if lazy
+            else getattr(pl, f"read_{format}")(source)
+        )
+
+    def write(df: pl.DataFrame, f: Any) -> None:
+        if lazy:
+            getattr(df.lazy(), f"sink_{format}")(f)
+        else:
+            getattr(df, f"write_{format}")(f)
+
+    path = tmp_path / "x"
+
+    f_bytesio = io.BytesIO()
+    padding = 100 * b"\xff"
+
+    with path.open("wb") as f_disk:
+        f = f_bytesio if use_bytesio else f_disk
+        f.write(padding)
+        write(pl.DataFrame({"x": 1}), f)
+
+    f_bytesio.seek(0)
+
+    with path.open("rb") as f_disk:
+        f = f_bytesio if use_bytesio else f_disk
+        assert f.read(100) == padding
+
+        assert_frame_equal(read(f), pl.DataFrame({"x": 1}))
