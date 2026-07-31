@@ -183,6 +183,7 @@ def test_sink_boolean_panic_25806(sink: Any, scan: Any) -> None:
 
     f = io.BytesIO()
     sink(df.lazy(), f)
+    f.seek(0)
 
     assert_frame_equal(scan(f).collect(), df)
 

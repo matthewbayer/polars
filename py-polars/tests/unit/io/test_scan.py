@@ -1636,6 +1636,7 @@ def test_scan_slice_filter_pushdown_22790() -> None:
     f = io.BytesIO()
     df = pl.DataFrame({"a": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]})
     df.write_parquet(f)
+    f.seek(0)
 
     q = pl.scan_parquet(f).tail(5).filter((pl.col("a") % 5).is_between(2, 3))
 
