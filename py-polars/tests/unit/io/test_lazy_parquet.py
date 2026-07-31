@@ -976,6 +976,7 @@ assert pl.thread_pool_size() == 1
 
 f = io.BytesIO()
 pl.DataFrame({"x": 1}).write_parquet(f)
+f.seek(0)
 
 q = (
     pl.scan_parquet(f)
@@ -1212,6 +1213,8 @@ def test_scan_parquet_filter_index_panic_23849(plmonkeypatch: PlMonkeyPatch) -> 
     pl.select(
         pl.int_range(0, num_rows).alias(f"col_{i}") for i in range(num_cols)
     ).write_parquet(f)
+
+    f.seek(0)
 
     for parallel in ["auto", "columns", "row_groups", "prefiltered", "none"]:
         pl.scan_parquet(f, parallel=parallel).filter(  # type: ignore[arg-type]

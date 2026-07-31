@@ -301,6 +301,7 @@ def test_scan_ipc_varying_block_metadata_len_c4812(
             reader.get_batch(i).num_rows for i in range(reader.num_record_batches)
         ] == [1, 1]
 
+    buf.seek(0)
     assert_frame_equal(pl.scan_ipc(buf).collect(), df)
 
 
