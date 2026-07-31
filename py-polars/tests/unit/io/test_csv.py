@@ -3163,3 +3163,17 @@ def test_read_csv_use_pyarrow_multiple_sources_unsupported() -> None:
 
     with pytest.raises(TypeError):
         pl.read_csv([b"a\n1"], use_pyarrow=True)
+
+
+def test_read_csv_from_file_offset() -> None:
+    f = io.StringIO("""\
+A|B|C|D
+1,2,3,4
+""")
+
+    headers = [str.lower(x) for x in f.readline().strip().split("|")]
+
+    assert_frame_equal(
+        pl.scan_csv(f, has_header=False, new_columns=headers).collect(),
+        pl.DataFrame({"a": 1, "b": 2, "c": 3, "d": 4}),
+    )
