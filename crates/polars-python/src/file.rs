@@ -415,7 +415,6 @@ pub(crate) fn try_get_pyfile(
         .call_method0("tell")
         .and_then(|x| x.extract())
         .unwrap_or(0);
-    dbg!(start_offset);
     let f = PyFileLikeObject::new(py_f.unbind(), expects_str, has_flush, start_offset);
     Ok((EitherRustPythonFile::Py(f), None))
 }
