@@ -22,12 +22,14 @@ with contextlib.suppress(ImportError):  # Module not available when building doc
     from polars._plr import gen_uuid_v7
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import pyiceberg.catalog
     import pyiceberg.table
 
     import polars as pl
     from polars._plr import PyLazyFrame
-    from polars._typing import StorageOptionsDict
+    from polars._typing import EngineType, StorageOptionsDict
 
 
 def _partition_key_exprs(table: pyiceberg.table.Table) -> list[pl.Expr] | None:
@@ -112,9 +114,12 @@ class IcebergSinkState:
     catalog_properties: dict[str, str]
 
     table_name: str
-    mode: Literal["append", "overwrite"]
+    mode: Literal["append", "overwrite", "upsert", "delete", "overwrite_files"]
     snapshot_properties: dict[str, str]
     iceberg_storage_properties: StorageOptionsDict
+
+    base_snapshot_id: int | None
+    data_file_paths_to_delete: list[str]
 
     sink_uuid_str: str
 
@@ -125,7 +130,9 @@ class IcebergSinkState:
     def new(
         target: str | pyiceberg.table.Table,
         *,
-        mode: Literal["append", "overwrite"] = "append",
+        mode: Literal[
+            "append", "overwrite", "upsert", "delete", "overwrite_files"
+        ] = "append",
         snapshot_properties: dict[str, str] | None = None,
         catalog: pyiceberg.catalog.Catalog | IcebergCatalogConfig | None = None,
         storage_options: StorageOptionsDict | None = None,
@@ -165,6 +172,8 @@ class IcebergSinkState:
             mode=mode,
             snapshot_properties=snapshot_properties or {},
             iceberg_storage_properties=storage_options or {},
+            base_snapshot_id=None,
+            data_file_paths_to_delete=[],
             sink_uuid_str=gen_uuid_v7().hex(),
             table_=NoPickleOption(target if not isinstance(target, str) else None),
             commit_result_df=NoPickleOption(),
@@ -194,6 +203,115 @@ class IcebergSinkState:
 
     def attach_sink(self, lf: pl.LazyFrame) -> pl.LazyFrame:
         return wrap_ldf(lf._ldf.sink_iceberg(self))
+
+    def copy_on_write(
+        self,
+        lf: pl.LazyFrame,
+        *,
+        on: str | Sequence[str],
+        engine: EngineType,
+    ) -> pl.DataFrame:
+        import polars as pl
+
+        keys = [on] if isinstance(on, str) else list(on)
+        if not keys or len(keys) != len(set(keys)):
+            msg = "`on` must contain at least one unique column name"
+            raise ValueError(msg)
+
+        table = self.table()
+        source_schema = lf.collect_schema()
+        missing_source_keys = set(keys).difference(source_schema)
+        if missing_source_keys:
+            msg = (
+                "copy-on-write keys not found in source schema: "
+                f"{sorted(missing_source_keys)}"
+            )
+            raise ValueError(msg)
+
+        from pyiceberg.io.pyarrow import schema_to_pyarrow
+
+        table_schema = pl.Schema(schema_to_pyarrow(table.schema()))
+        missing_table_keys = set(keys).difference(table_schema)
+        if missing_table_keys:
+            msg = (
+                "copy-on-write keys not found in Iceberg schema: "
+                f"{sorted(missing_table_keys)}"
+            )
+            raise ValueError(msg)
+
+        if self.mode == "upsert" and source_schema != table_schema:
+            msg = "upsert source schema must match the Iceberg table schema"
+            raise pl.exceptions.SchemaError(msg)
+
+        source_keys = lf.select(keys).collect(engine=engine)
+        if source_keys.is_empty():
+            return self._set_commit_result(table.metadata_location)
+
+        if any(source_keys.null_count().row(0)):
+            msg = "copy-on-write keys cannot contain null values"
+            raise ValueError(msg)
+
+        unique_source_keys = source_keys.unique()
+        if self.mode == "upsert" and unique_source_keys.height != source_keys.height:
+            msg = "upsert source contains duplicate keys"
+            raise pl.exceptions.DuplicateError(msg)
+
+        snapshot = table.current_snapshot()
+        if snapshot is None:
+            if self.mode == "delete":
+                return self._set_commit_result(table.metadata_location)
+
+            self.mode = "append"
+            self.attach_sink(lf).collect(engine=engine)
+            return self.commit_result_df.get()  # type: ignore[return-value]
+
+        file_path_column = "__POLARS_ICEBERG_COW_FILE_PATH"
+        while file_path_column in table_schema:
+            file_path_column += "_"
+
+        from polars.io.iceberg.functions import scan_iceberg
+
+        target = scan_iceberg(
+            table,
+            snapshot_id=snapshot.snapshot_id,
+            reader_override="native",
+            _include_file_paths=file_path_column,
+        )
+        touched_paths = (
+            target.select(*keys, file_path_column)
+            .join(unique_source_keys.lazy(), on=keys, how="semi")
+            .select(file_path_column)
+            .unique()
+            .collect(engine=engine)
+            .get_column(file_path_column)
+            .to_list()
+        )
+
+        if not touched_paths:
+            if self.mode == "delete":
+                return self._set_commit_result(table.metadata_location)
+
+            self.mode = "append"
+            self.attach_sink(lf).collect(engine=engine)
+            return self.commit_result_df.get()  # type: ignore[return-value]
+
+        retained_rows = (
+            target.filter(pl.col(file_path_column).is_in(touched_paths))
+            .drop(file_path_column)
+            .join(unique_source_keys.lazy(), on=keys, how="anti")
+        )
+        output = (
+            pl.concat([retained_rows, lf], how="vertical")
+            if self.mode == "upsert"
+            else retained_rows
+        )
+
+        self.mode = "overwrite_files"
+        self.base_snapshot_id = snapshot.snapshot_id
+        self.data_file_paths_to_delete = touched_paths
+        self.attach_sink(output).collect(engine=engine)
+
+        return self.commit_result_df.get()  # type: ignore[return-value]
 
     def _attach_resolved_sink(self, plf: PyLazyFrame) -> PyLazyFrame:
         from pyiceberg.table import TableProperties
@@ -274,7 +392,6 @@ class IcebergSinkState:
         )
 
     def commit(self, data_file_paths: list[str]) -> pl.DataFrame:
-        import polars as pl
         import polars._utils.logging
 
         function_start_instant = perf_counter()
@@ -299,16 +416,21 @@ class IcebergSinkState:
 
                 tx.delete(AlwaysTrue(), snapshot_properties=self.snapshot_properties)
 
-            if verbose:
-                eprint("IcebergSinkState[commit]: begin add_files")
-
             start_instant = perf_counter()
 
-            tx.add_files(
-                data_file_paths,
-                snapshot_properties=self.snapshot_properties,
-                check_duplicate_files=False,
-            )
+            if self.mode == "overwrite_files":
+                self._overwrite_files(tx, data_file_paths)
+            else:
+                if verbose:
+                    eprint("IcebergSinkState[commit]: begin add_files")
+
+                start_instant = perf_counter()
+
+                tx.add_files(
+                    data_file_paths,
+                    snapshot_properties=self.snapshot_properties,
+                    check_duplicate_files=False,
+                )
 
             if verbose:
                 elapsed = perf_counter() - start_instant
@@ -330,13 +452,7 @@ class IcebergSinkState:
 
         assert new_metadata_location != original_metadata_location
 
-        self.commit_result_df.set(
-            pl.DataFrame(
-                {"metadata_path": new_metadata_location},
-                schema={"metadata_path": pl.String},
-                height=1,
-            )
-        )
+        self._set_commit_result(new_metadata_location)
 
         if now is not None:
             total_elapsed = now - function_start_instant
@@ -346,6 +462,65 @@ class IcebergSinkState:
             )
 
         return self.commit_result_df.get()  # type: ignore[return-value]
+
+    def _overwrite_files(
+        self,
+        transaction: pyiceberg.table.Transaction,
+        data_file_paths: list[str],
+    ) -> None:
+        from pyiceberg.io.pyarrow import parquet_files_to_data_files
+        from pyiceberg.table import TableProperties
+
+        table = self.table()
+        assert self.base_snapshot_id is not None
+
+        current_snapshot = table.current_snapshot()
+        if (
+            current_snapshot is None
+            or current_snapshot.snapshot_id != self.base_snapshot_id
+        ):
+            msg = "Iceberg table changed while planning copy-on-write operation"
+            raise RuntimeError(msg)
+
+        files_by_path = {
+            _normalize_windows_iceberg_file_uri(task.file.file_path): task.file
+            for task in table.scan(snapshot_id=self.base_snapshot_id).plan_files()
+        }
+        missing_paths = set(self.data_file_paths_to_delete).difference(files_by_path)
+        if missing_paths:
+            msg = f"copy-on-write data files not found in base snapshot: {sorted(missing_paths)}"
+            raise RuntimeError(msg)
+
+        if transaction.table_metadata.name_mapping() is None:
+            transaction.set_properties(
+                {
+                    TableProperties.DEFAULT_NAME_MAPPING: transaction.table_metadata.schema().name_mapping.model_dump_json()
+                }
+            )
+
+        added_files = parquet_files_to_data_files(
+            io=table.io,
+            table_metadata=transaction.table_metadata,
+            file_paths=iter(data_file_paths),
+        )
+        with transaction.update_snapshot(
+            snapshot_properties=self.snapshot_properties
+        ).overwrite() as overwrite:
+            for path in self.data_file_paths_to_delete:
+                overwrite.delete_data_file(files_by_path[path])
+            for data_file in added_files:
+                overwrite.append_data_file(data_file)
+
+    def _set_commit_result(self, metadata_location: str) -> pl.DataFrame:
+        import polars as pl
+
+        result = pl.DataFrame(
+            {"metadata_path": metadata_location},
+            schema={"metadata_path": pl.String},
+            height=1,
+        )
+        self.commit_result_df.set(result)
+        return result
 
     def sink_base_path(self, *, object_storage_enabled: bool) -> str:
         from pyiceberg.table import TableProperties

@@ -558,6 +558,152 @@ def test_sink_iceberg_all_types(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.write_disk
+def test_sink_iceberg_copy_on_write_upsert(tmp_path: Path) -> None:
+    tbl, _ = new_iceberg_table(
+        tmp_path,
+        schema=IcebergSchema(
+            NestedField(1, "id", LongType(), required=True),
+            NestedField(2, "value", StringType()),
+        ),
+    )
+    pl.LazyFrame({"id": [1, 2], "value": ["a", "b"]}).sink_iceberg(tbl, mode="append")
+    first_append_paths = {task.file.file_path for task in tbl.scan().plan_files()}
+    pl.LazyFrame({"id": [3, 4], "value": ["c", "d"]}).sink_iceberg(tbl, mode="append")
+    second_append_paths = {
+        task.file.file_path for task in tbl.scan().plan_files()
+    }.difference(first_append_paths)
+    assert len(first_append_paths) == len(second_append_paths) == 1
+
+    metadata_path = (
+        pl.LazyFrame({"id": [2, 5], "value": ["updated", "inserted"]})
+        .sink_iceberg(tbl, mode="upsert", on="id")
+        .item()
+    )
+
+    assert metadata_path == tbl.metadata_location
+    assert_frame_equal(
+        pl.scan_iceberg(tbl).collect().sort("id"),
+        pl.DataFrame(
+            {
+                "id": [1, 2, 3, 4, 5],
+                "value": ["a", "updated", "c", "d", "inserted"],
+            }
+        ),
+    )
+    current_paths = {task.file.file_path for task in tbl.scan().plan_files()}
+    assert first_append_paths.isdisjoint(current_paths)
+    assert second_append_paths < current_paths
+    snapshot = tbl.current_snapshot()
+    assert snapshot is not None
+    assert snapshot.summary.operation.value == "overwrite"
+
+
+@pytest.mark.write_disk
+def test_sink_iceberg_copy_on_write_delete(tmp_path: Path) -> None:
+    tbl, _ = new_iceberg_table(
+        tmp_path,
+        schema=IcebergSchema(
+            NestedField(1, "id", LongType(), required=True),
+            NestedField(2, "value", StringType()),
+        ),
+    )
+    pl.LazyFrame({"id": [1, 2], "value": ["a", "b"]}).sink_iceberg(tbl, mode="append")
+    untouched_paths = {task.file.file_path for task in tbl.scan().plan_files()}
+    pl.LazyFrame({"id": [3, 4], "value": ["c", "d"]}).sink_iceberg(tbl, mode="append")
+
+    pl.LazyFrame({"id": [3]}).sink_iceberg(tbl, mode="delete", on="id")
+
+    assert_frame_equal(
+        pl.scan_iceberg(tbl).collect().sort("id"),
+        pl.DataFrame({"id": [1, 2, 4], "value": ["a", "b", "d"]}),
+    )
+    current_paths = {task.file.file_path for task in tbl.scan().plan_files()}
+    assert untouched_paths < current_paths
+
+
+@pytest.mark.write_disk
+def test_sink_iceberg_copy_on_write_delete_entire_file(tmp_path: Path) -> None:
+    tbl, _ = new_iceberg_table(
+        tmp_path,
+        schema=IcebergSchema(
+            NestedField(1, "id", LongType(), required=True),
+            NestedField(2, "value", StringType()),
+        ),
+    )
+    pl.LazyFrame({"id": [1, 2], "value": ["a", "b"]}).sink_iceberg(tbl, mode="append")
+    untouched_paths = {task.file.file_path for task in tbl.scan().plan_files()}
+    pl.LazyFrame({"id": [3, 4], "value": ["c", "d"]}).sink_iceberg(tbl, mode="append")
+
+    pl.LazyFrame({"id": [3, 4]}).sink_iceberg(tbl, mode="delete", on="id")
+
+    assert_frame_equal(
+        pl.scan_iceberg(tbl).collect().sort("id"),
+        pl.DataFrame({"id": [1, 2], "value": ["a", "b"]}),
+    )
+    assert {task.file.file_path for task in tbl.scan().plan_files()} == untouched_paths
+
+
+@pytest.mark.write_disk
+def test_sink_iceberg_copy_on_write_partitioned_upsert(tmp_path: Path) -> None:
+    tbl, _ = new_iceberg_table(
+        tmp_path,
+        schema=IcebergSchema(
+            NestedField(1, "id", LongType(), required=True),
+            NestedField(2, "partition", StringType(), required=True),
+            NestedField(3, "value", StringType()),
+        ),
+        partition_spec=PartitionSpec(
+            PartitionField(2, 1000, IdentityTransform(), "partition")
+        ),
+    )
+    pl.LazyFrame(
+        {"id": [1, 2], "partition": ["a", "b"], "value": ["old", "keep"]}
+    ).sink_iceberg(tbl, mode="append")
+
+    pl.LazyFrame(
+        {"id": [1, 3], "partition": ["c", "a"], "value": ["new", "insert"]}
+    ).sink_iceberg(tbl, mode="upsert", on="id")
+
+    assert_frame_equal(
+        pl.scan_iceberg(tbl).collect().sort("id"),
+        pl.DataFrame(
+            {
+                "id": [1, 2, 3],
+                "partition": ["c", "b", "a"],
+                "value": ["new", "keep", "insert"],
+            }
+        ),
+    )
+    assert {task.file.partition[0] for task in tbl.scan().plan_files()} == {
+        "a",
+        "b",
+        "c",
+    }
+
+
+@pytest.mark.write_disk
+def test_sink_iceberg_copy_on_write_validation(tmp_path: Path) -> None:
+    tbl, _ = new_iceberg_table(
+        tmp_path,
+        schema=IcebergSchema(
+            NestedField(1, "id", LongType(), required=True),
+            NestedField(2, "value", StringType()),
+        ),
+    )
+    pl.LazyFrame({"id": [1], "value": ["a"]}).sink_iceberg(tbl, mode="append")
+
+    with pytest.raises(pl.exceptions.DuplicateError, match="duplicate keys"):
+        pl.LazyFrame({"id": [1, 1], "value": ["b", "c"]}).sink_iceberg(
+            tbl, mode="upsert", on="id"
+        )
+
+    metadata_location = tbl.metadata_location
+    result = pl.LazyFrame({"id": [99]}).sink_iceberg(tbl, mode="delete", on="id")
+    assert result.item() == metadata_location
+    assert tbl.metadata_location == metadata_location
+
+
 @pytest.mark.parametrize(
     ("iceberg_type", "transform", "values"),
     [

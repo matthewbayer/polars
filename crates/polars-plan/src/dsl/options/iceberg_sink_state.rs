@@ -23,6 +23,9 @@ pub struct IcebergSinkState {
     pub snapshot_properties: BTreeMap<PlSmallStr, PlSmallStr>,
     pub iceberg_storage_properties: BTreeMap<PlSmallStr, PlSmallStr>,
 
+    pub base_snapshot_id: Option<i64>,
+    pub data_file_paths_to_delete: Vec<PlSmallStr>,
+
     pub sink_uuid_str: String,
 
     #[cfg(feature = "python")]
@@ -38,6 +41,7 @@ pub struct IcebergSinkState {
 pub enum IcebergCommitMode {
     Append,
     Overwrite,
+    OverwriteFiles,
 }
 
 #[cfg(feature = "python")]
@@ -70,6 +74,7 @@ mod _python_impl {
             match self {
                 Self::Append => "append",
                 Self::Overwrite => "overwrite",
+                Self::OverwriteFiles => "overwrite_files",
             }
             .into_pyobject(py)
         }
@@ -82,6 +87,7 @@ mod _python_impl {
             Ok(match &*ob.extract::<PyBackedStr>()? {
                 "append" => Self::Append,
                 "overwrite" => Self::Overwrite,
+                "overwrite_files" => Self::OverwriteFiles,
                 v => {
                     return Err(PyValueError::new_err(format!(
                         "invalid iceberg commit mode: '{v}'"

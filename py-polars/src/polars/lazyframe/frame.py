@@ -3363,7 +3363,8 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         self,
         target: str | pyiceberg.table.Table,
         *,
-        mode: Literal["append", "overwrite"],
+        mode: Literal["append", "overwrite", "upsert", "delete"],
+        on: str | Sequence[str] | None = None,
         snapshot_properties: dict[str, str] | None = None,
         catalog: pyiceberg.catalog.Catalog
         | polars.io.iceberg.IcebergCatalogConfig
@@ -3382,11 +3383,16 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ----------
         target
             A PyIceberg Table object, or a 'namespace.table_name' identifier string.
-        mode : {'append', 'overwrite'}
+        mode : {'append', 'overwrite', 'upsert', 'delete'}
             How to handle existing data.
 
             - If 'append', will add new data.
             - If 'overwrite', will replace table with new data.
+            - If 'upsert', will replace matching rows and insert new rows.
+            - If 'delete', will delete rows matching keys from this LazyFrame.
+        on
+            Column names used to match rows for copy-on-write upserts and deletes.
+            Values must not be null, and upsert rows must be unique on these columns.
         snapshot_properties
             Custom properties to add to the Iceberg snapshot summary.
         catalog
@@ -3414,6 +3420,15 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             catalog=catalog,
             storage_options=storage_options,
         )
+
+        if mode in ("upsert", "delete"):
+            if on is None:
+                msg = f"`on` is required for Iceberg mode {mode!r}"
+                raise ValueError(msg)
+            return sink_state.copy_on_write(self, on=on, engine=engine)
+        if on is not None:
+            msg = "`on` is only supported for Iceberg upserts and deletes"
+            raise ValueError(msg)
 
         sink_state.attach_sink(self).collect(engine=engine)
 

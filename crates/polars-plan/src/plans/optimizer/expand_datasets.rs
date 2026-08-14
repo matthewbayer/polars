@@ -330,7 +330,7 @@ fn expand_python_dataset(
                 cast_columns_policy,
                 missing_columns_policy,
                 extra_columns_policy,
-                include_file_paths: _include_file_paths @ None,
+                include_file_paths,
                 deletion_files,
                 table_statistics,
                 row_count,
@@ -348,6 +348,7 @@ fn expand_python_dataset(
             unified_scan_args.cast_columns_policy = cast_columns_policy.clone();
             unified_scan_args.missing_columns_policy = *missing_columns_policy;
             unified_scan_args.extra_columns_policy = *extra_columns_policy;
+            unified_scan_args.include_file_paths = include_file_paths.clone();
             unified_scan_args.column_mapping = column_mapping.clone();
             unified_scan_args.default_values = default_values.clone();
             unified_scan_args.deletion_files = deletion_files.clone();

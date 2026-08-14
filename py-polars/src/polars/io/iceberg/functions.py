@@ -36,6 +36,7 @@ def scan_iceberg(
     use_metadata_statistics: bool = True,
     fast_deletion_count: bool | None = None,
     use_pyiceberg_filter: bool = True,
+    _include_file_paths: str | None = None,
 ) -> LazyFrame:
     """
     Lazily read from an Apache Iceberg table.
@@ -173,7 +174,7 @@ def scan_iceberg(
     """
     from polars._plr import PyLazyFrame
 
-    if reader_override is not None:
+    if reader_override is not None and _include_file_paths is None:
         msg = "the `reader_override` parameter of `scan_iceberg()` is considered unstable."
         issue_unstable_warning(msg)
 
@@ -219,6 +220,7 @@ def scan_iceberg(
         use_metadata_statistics=use_metadata_statistics,
         fast_deletion_count=fast_deletion_count,
         use_pyiceberg_filter=use_pyiceberg_filter,
+        include_file_paths=_include_file_paths,
     )
 
     return wrap_ldf(PyLazyFrame.new_from_dataset_object(dataset))

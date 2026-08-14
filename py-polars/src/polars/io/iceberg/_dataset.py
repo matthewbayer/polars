@@ -8,7 +8,9 @@ from time import perf_counter
 from typing import TYPE_CHECKING, Any, Final, Literal, TypeAlias
 
 import polars._reexport as pl
+from polars._dependencies import pyarrow as pa
 from polars._utils.logging import eprint, verbose, verbose_print_sensitive
+from polars.datatypes import UInt32
 from polars.exceptions import ComputeError
 from polars.io.iceberg._utils import (
     IcebergStatisticsLoader,
@@ -20,7 +22,6 @@ from polars.io.iceberg._utils import (
 from polars.io.scan_options.cast_options import ScanCastOptions
 
 if TYPE_CHECKING:
-    import pyarrow as pa
     import pyiceberg.catalog
     import pyiceberg.schema
     import pyiceberg.table
@@ -213,6 +214,7 @@ class IcebergScanResolver:
     use_metadata_statistics: bool
     fast_deletion_count: bool
     use_pyiceberg_filter: bool
+    include_file_paths: str | None = None
 
     #
     # PythonDatasetProvider interface functions
@@ -220,7 +222,10 @@ class IcebergScanResolver:
 
     def schema(self) -> pa.schema:
         """Fetch the schema of the table."""
-        return self.table.arrow_schema()
+        schema = self.table.arrow_schema()
+        if self.include_file_paths is not None:
+            schema = schema.append(pa.field(self.include_file_paths, pa.string()))
+        return schema
 
     def to_dataset_scan(
         self,
@@ -362,11 +367,14 @@ class IcebergScanResolver:
         )
 
         selected_fields = ("*",) if projection is None else tuple(projection)
+        iceberg_selected_fields = tuple(
+            field for field in selected_fields if field != self.include_file_paths
+        )
 
         projected_iceberg_schema = (
             iceberg_schema
-            if selected_fields == ("*",)
-            else iceberg_schema.select(*selected_fields)
+            if iceberg_selected_fields == ("*",)
+            else iceberg_schema.select(*iceberg_selected_fields)
         )
 
         initial_defaults = {
@@ -385,9 +393,14 @@ class IcebergScanResolver:
             tbl,
             projected_iceberg_schema,
         )
+        iceberg_filter_columns = (
+            [field for field in filter_columns if field != self.include_file_paths]
+            if filter_columns is not None
+            else None
+        )
         statistics_loader: IcebergStatisticsLoader | None = (
-            IcebergStatisticsLoader(tbl, iceberg_schema.select(*filter_columns))
-            if self.use_metadata_statistics and filter_columns is not None
+            IcebergStatisticsLoader(tbl, iceberg_schema.select(*iceberg_filter_columns))
+            if self.use_metadata_statistics and iceberg_filter_columns is not None
             else None
         )
         position_delete_files: dict[int, list[str]] = {}
@@ -408,7 +421,7 @@ class IcebergScanResolver:
             scan = tbl.scan(
                 snapshot_id=snapshot_id,
                 limit=limit,
-                selected_fields=selected_fields,
+                selected_fields=iceberg_selected_fields,
             )
 
             if iceberg_table_filter is not None:
@@ -509,6 +522,19 @@ class IcebergScanResolver:
                 if statistics_loader is not None
                 else None
             )
+            if (
+                min_max_statistics is not None
+                and self.include_file_paths is not None
+                and filter_columns is not None
+                and self.include_file_paths in filter_columns
+            ):
+                column = self.include_file_paths
+                file_paths = pl.Series(column, sources)
+                min_max_statistics = min_max_statistics.with_columns(
+                    pl.Series(f"{column}_nc", [0] * len(sources), dtype=UInt32),
+                    file_paths.alias(f"{column}_min"),
+                    file_paths.alias(f"{column}_max"),
+                )
 
             storage_options = (
                 _convert_iceberg_to_object_store_storage_options(
@@ -537,6 +563,7 @@ class IcebergScanResolver:
                     else None
                 ),
                 snapshot_id_key=snapshot_id_key,
+                include_file_paths=self.include_file_paths,
             )
 
         elif reader_override == "native":
@@ -597,6 +624,7 @@ class _NativeIcebergScanData(_ResolvedScanDataBase):
     # (physical, deleted)
     row_count: tuple[int, int] | None
     snapshot_id_key: str
+    include_file_paths: str | None
 
     def to_lazyframe(self) -> pl.LazyFrame:
         from polars.io.parquet.functions import scan_parquet
@@ -615,6 +643,7 @@ class _NativeIcebergScanData(_ResolvedScanDataBase):
             ),
             _table_statistics=self.min_max_statistics,
             _row_count=self.row_count,
+            include_file_paths=self.include_file_paths,
         )
 
 
