@@ -7,15 +7,20 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_FAST_RELEASE_DEBUG: 0
+  CARGO_PROFILE_FAST_RELEASE_CODEGEN_UNITS: 256
+  RUSTFLAGS: -C debuginfo=0
+
 jobs:
-  benchmark:
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    env:
-      CARGO_BUILD_JOBS: 2
-      CARGO_PROFILE_FAST_RELEASE_DEBUG: 0
-      CARGO_PROFILE_FAST_RELEASE_CODEGEN_UNITS: 256
-      RUSTFLAGS: -C debuginfo=0
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, patched]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -23,35 +28,66 @@ jobs:
           python-version: '3.13'
       - name: Free build disk space
         uses: jlumbroso/free-disk-space@v1.3.1
-      - name: Prepare benchmark and release source
+      - name: Prepare Polars 2.1.0 source
         run: |
-          cp -r .github/coalescing-benchmark "$RUNNER_TEMP/benchmark"
+          cp .github/coalescing-benchmark/change.patch "$RUNNER_TEMP/change.patch"
           git fetch --depth 1 https://github.com/pola-rs/polars.git 7f902bd3ffd27ff82d14278a09a295ff2f7aed92
           git checkout --detach FETCH_HEAD
-          python -m pip install 'polars==2.1.0' 'pyarrow==23.0.1' 'numpy==2.5.4' 'maturin>=1.9,<2'
+          python -m pip install 'maturin>=1.9,<2'
           rustup show
-          df -h .
-          nproc
+      - name: Apply candidate patch
+        if: matrix.variant == 'patched'
+        run: |
+          git apply "$RUNNER_TEMP/change.patch"
+          git diff --check
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: polars-2.1-cloud-coalescing-full
           cache-on-failure: true
           cache-all-crates: true
-      - name: Build baseline Polars 2.1.0
-        run: |
-          maturin build --profile fast-release --features backtrace_filter --manifest-path py-polars/runtime/polars-runtime-32/Cargo.toml --out "$RUNNER_TEMP/baseline-wheels"
-          python -m pip install --no-deps --target "$RUNNER_TEMP/baseline-runtime" "$RUNNER_TEMP"/baseline-wheels/*.whl
-      - name: Build patched Polars 2.1.0
-        run: |
-          git apply "$RUNNER_TEMP/benchmark/change.patch"
-          git diff --check
-          maturin build --profile fast-release --features backtrace_filter --manifest-path py-polars/runtime/polars-runtime-32/Cargo.toml --out "$RUNNER_TEMP/patched-wheels"
-          python -m pip install --no-deps --target "$RUNNER_TEMP/patched-runtime" "$RUNNER_TEMP"/patched-wheels/*.whl
-      - name: Run paired benchmarks
-        run: |
-          python "$RUNNER_TEMP/benchmark/benchmark.py" --baseline "$RUNNER_TEMP/baseline-runtime" --patched "$RUNNER_TEMP/patched-runtime" --output "$RUNNER_TEMP/results" --repeats 7
-      - name: Run cloud range unit tests
+      - name: Build Polars 2.1.0
+        run: maturin build --profile fast-release --features backtrace_filter --manifest-path py-polars/runtime/polars-runtime-32/Cargo.toml --out "$RUNNER_TEMP/wheels"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.variant }}-runtime-wheel
+          path: ${{ runner.temp }}/wheels/*.whl
+
+  range-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: polars-cloud-range-tests
+          cache-on-failure: true
+      - name: Test cloud range planning on current main plus patch
         run: cargo test -p polars-io --no-default-features --features cloud,parquet --lib cloud::polars_object_store::tests --profile fast-release
+
+  benchmark:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v7
+        with:
+          name: baseline-runtime-wheel
+          path: /tmp/baseline-wheel
+      - uses: actions/download-artifact@v7
+        with:
+          name: patched-runtime-wheel
+          path: /tmp/patched-wheel
+      - name: Install matching runtimes
+        run: |
+          python -m pip install 'polars==2.1.0' 'pyarrow==23.0.1' 'numpy==2.5.4'
+          python -m pip install --no-deps --target "$RUNNER_TEMP/baseline-runtime" /tmp/baseline-wheel/*.whl
+          python -m pip install --no-deps --target "$RUNNER_TEMP/patched-runtime" /tmp/patched-wheel/*.whl
+      - name: Run paired benchmarks
+        run: python .github/coalescing-benchmark/benchmark.py --baseline "$RUNNER_TEMP/baseline-runtime" --patched "$RUNNER_TEMP/patched-runtime" --output "$RUNNER_TEMP/results" --repeats 7
       - uses: actions/upload-artifact@v6
         if: always()
         with:
@@ -59,11 +95,4 @@ jobs:
           path: |
             ${{ runner.temp }}/results/*.json
             ${{ runner.temp }}/results/*.jsonl
-            ${{ runner.temp }}/benchmark/*
-      - uses: actions/upload-artifact@v6
-        if: always()
-        with:
-          name: polars-2.1-benchmark-wheels
-          path: |
-            ${{ runner.temp }}/baseline-wheels/*.whl
-            ${{ runner.temp }}/patched-wheels/*.whl
+            .github/coalescing-benchmark/*
