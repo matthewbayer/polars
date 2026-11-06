@@ -1,0 +1,54 @@
+name: Cloud range coalescing benchmark
+
+on:
+  push:
+    branches: [bench/cloud-range-coalescing-2.1]
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_FAST_RELEASE_DEBUG: 0
+      CARGO_PROFILE_FAST_RELEASE_CODEGEN_UNITS: 256
+      RUSTFLAGS: -C debuginfo=0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Prepare benchmark and release source
+        run: |
+          cp -r .github/coalescing-benchmark "$RUNNER_TEMP/benchmark"
+          git fetch --depth 1 origin tag py-2.1.0
+          git checkout --detach py-2.1.0
+          python -m pip install 'polars==2.1.0' 'pyarrow==23.0.1' 'numpy==2.5.4' 'maturin>=1.9,<2'
+          rustup show
+          df -h .
+      - name: Build baseline Polars 2.1.0
+        run: |
+          maturin build --profile fast-release --no-default-features --features parquet,cloud,streaming,dtypes --manifest-path py-polars/runtime/polars-runtime-32/Cargo.toml --out "$RUNNER_TEMP/baseline-wheels"
+          python -m pip install --no-deps --target "$RUNNER_TEMP/baseline-runtime" "$RUNNER_TEMP"/baseline-wheels/*.whl
+      - name: Build patched Polars 2.1.0
+        run: |
+          git apply "$RUNNER_TEMP/benchmark/change.patch"
+          git diff --check
+          maturin build --profile fast-release --no-default-features --features parquet,cloud,streaming,dtypes --manifest-path py-polars/runtime/polars-runtime-32/Cargo.toml --out "$RUNNER_TEMP/patched-wheels"
+          python -m pip install --no-deps --target "$RUNNER_TEMP/patched-runtime" "$RUNNER_TEMP"/patched-wheels/*.whl
+      - name: Run paired benchmarks
+        run: |
+          python "$RUNNER_TEMP/benchmark/benchmark.py" --baseline "$RUNNER_TEMP/baseline-runtime" --patched "$RUNNER_TEMP/patched-runtime" --output "$RUNNER_TEMP/results" --repeats 7
+      - name: Run cloud range unit tests
+        run: cargo test -p polars-io --no-default-features --features cloud,parquet --lib cloud::polars_object_store::tests --profile fast-release
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: polars-2.1-coalescing-results
+          path: |
+            ${{ runner.temp }}/results/*.json
+            ${{ runner.temp }}/results/*.jsonl
+            ${{ runner.temp }}/benchmark/*
