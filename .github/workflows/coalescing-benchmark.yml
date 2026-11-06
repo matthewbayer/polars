@@ -21,6 +21,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
+      - name: Free build disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
       - name: Prepare benchmark and release source
         run: |
           cp -r .github/coalescing-benchmark "$RUNNER_TEMP/benchmark"
@@ -29,15 +31,21 @@ jobs:
           python -m pip install 'polars==2.1.0' 'pyarrow==23.0.1' 'numpy==2.5.4' 'maturin>=1.9,<2'
           rustup show
           df -h .
+          nproc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: polars-2.1-cloud-coalescing-full
+          cache-on-failure: true
+          cache-all-crates: true
       - name: Build baseline Polars 2.1.0
         run: |
-          maturin build --profile fast-release --no-default-features --features parquet,cloud,streaming,dtypes --manifest-path py-polars/runtime/polars-runtime-32/Cargo.toml --out "$RUNNER_TEMP/baseline-wheels"
+          maturin build --profile fast-release --features backtrace_filter --manifest-path py-polars/runtime/polars-runtime-32/Cargo.toml --out "$RUNNER_TEMP/baseline-wheels"
           python -m pip install --no-deps --target "$RUNNER_TEMP/baseline-runtime" "$RUNNER_TEMP"/baseline-wheels/*.whl
       - name: Build patched Polars 2.1.0
         run: |
           git apply "$RUNNER_TEMP/benchmark/change.patch"
           git diff --check
-          maturin build --profile fast-release --no-default-features --features parquet,cloud,streaming,dtypes --manifest-path py-polars/runtime/polars-runtime-32/Cargo.toml --out "$RUNNER_TEMP/patched-wheels"
+          maturin build --profile fast-release --features backtrace_filter --manifest-path py-polars/runtime/polars-runtime-32/Cargo.toml --out "$RUNNER_TEMP/patched-wheels"
           python -m pip install --no-deps --target "$RUNNER_TEMP/patched-runtime" "$RUNNER_TEMP"/patched-wheels/*.whl
       - name: Run paired benchmarks
         run: |
@@ -52,3 +60,10 @@ jobs:
             ${{ runner.temp }}/results/*.json
             ${{ runner.temp }}/results/*.jsonl
             ${{ runner.temp }}/benchmark/*
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: polars-2.1-benchmark-wheels
+          path: |
+            ${{ runner.temp }}/baseline-wheels/*.whl
+            ${{ runner.temp }}/patched-wheels/*.whl

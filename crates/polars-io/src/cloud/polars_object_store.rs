@@ -994,7 +994,7 @@ fn merge_ranges(
                         (current_n_bytes.max(range.len()) / 8).clamp(1024 * 1024, 8 * 1024 * 1024);
                     let useful_bytes = current_n_bytes + range.len();
                     let excess_bytes = new_merged.len() - useful_bytes;
-                    let excess_tolerance = (useful_bytes / 8).max(64 * 1024);
+                    let excess_tolerance = useful_bytes.max(64 * 1024);
 
                     leq_current_len_dist_to_chunk_size
                         && distance <= gap_tolerance
@@ -1177,6 +1177,18 @@ mod tests {
             )
             .collect::<Vec<_>>(),
             [(0..65539, 3), (98307..98308, 4)]
+        );
+        assert_eq!(
+            merge_ranges(
+                &[
+                    0..512 * 1024,
+                    1536 * 1024..2048 * 1024,
+                    3072 * 1024..3584 * 1024
+                ],
+                chunk_size,
+            )
+            .collect::<Vec<_>>(),
+            [(0..2048 * 1024, 2), (3072 * 1024..3584 * 1024, 3)]
         );
     }
 }
