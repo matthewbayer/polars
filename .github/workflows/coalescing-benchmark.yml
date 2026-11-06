@@ -24,8 +24,8 @@ jobs:
       - name: Prepare benchmark and release source
         run: |
           cp -r .github/coalescing-benchmark "$RUNNER_TEMP/benchmark"
-          git fetch --depth 1 origin tag py-2.1.0
-          git checkout --detach py-2.1.0
+          git fetch --depth 1 https://github.com/pola-rs/polars.git 7f902bd3ffd27ff82d14278a09a295ff2f7aed92
+          git checkout --detach FETCH_HEAD
           python -m pip install 'polars==2.1.0' 'pyarrow==23.0.1' 'numpy==2.5.4' 'maturin>=1.9,<2'
           rustup show
           df -h .
